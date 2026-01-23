@@ -1,6 +1,7 @@
 import os
 import json
 import torch
+import torch.distributed as dist
 from functools import lru_cache
 from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union, Callable
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -19,6 +20,18 @@ def load_config(config_path="tokenweave_configs/llama_config_8.json"):
     with open(full_path, "r") as f:
         data = json.load(f)
     return {int(k): v for k, v in data.items()}
+
+def supports_multimem(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability(device)
+    return major >= 9
+
+def _get_tp_device_group():
+    from vllm.distributed import get_tensor_model_parallel_group
+    return get_tensor_model_parallel_group().device_group
 
 
 def fused_allreduce_layernorm(
@@ -75,6 +88,48 @@ def fused_allreduce_layernorm(
 
     start_idx = rank * num_tokens_per_rank
     end_idx = (rank + 1) * num_tokens_per_rank
+
+    use_multimem = supports_multimem(hidden_states.device) and symm_mem_hdl is not None
+    if not use_multimem:
+        if world_size == 1:
+            cta = min(MAX_CTAS, num_tokens_per_rank) if MAX_CTAS is not None else None
+            layernorm(
+                hidden_states,
+                residual,
+                MAX_CTAS=cta,
+                fused_ar=False,
+                fused_rs=False,
+            )
+            return
+        if not dist.is_initialized():
+            raise RuntimeError("torch.distributed must be initialized for A100 tokenweave fallback.")
+        group = _get_tp_device_group()
+        local_tokens = num_tokens_per_rank
+        local_buf = torch.empty(
+            (local_tokens, hidden_states.shape[1]),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        dist.reduce_scatter_tensor(
+            local_buf,
+            hidden_states,
+            op=dist.ReduceOp.SUM,
+            group=group,
+        )
+        cta = min(MAX_CTAS, local_tokens) if MAX_CTAS is not None else None
+        layernorm(
+            local_buf,
+            residual[start_idx:end_idx],
+            MAX_CTAS=cta,
+            fused_ar=False,
+            fused_rs=False,
+        )
+        dist.all_gather_into_tensor(
+            hidden_states,
+            local_buf,
+            group=group,
+        )
+        return
 
     # ============================
     # Apply fused RMSNorm + AllReduce
@@ -200,6 +255,7 @@ def tokenweave_overlap(
         Tuple[torch.Tensor, torch.Tensor]: Updated hidden_states and residual tensors.
     """
     assert mlp_fn is not None, "mlp_fn must be provided"
+    use_multimem = supports_multimem(hidden_states.device) and symm_mem_hdl is not None
     num_bytes_per_token = hidden_states.shape[1] * hidden_states.element_size()
     # Self Attention
     offset_second = split_size * hidden_states.shape[1] * hidden_states.element_size()
@@ -214,24 +270,49 @@ def tokenweave_overlap(
     # === LayerNorm & Comm for First Layer ===
     if layer_id == 0:
         hidden_states_1 = self.input_layernorm(hidden_states_1, out=residual_1)
-        multimem_reduce_scatter(
-            hidden_states_2,
-            symm_mem_hdl,
-            offset_second,
-            MAX_CTAS=8
-        )
-        self.input_layernorm(
-            hidden_states_2[rank * blpr_2: (rank + 1) * blpr_2], 
-            out=residual_2[rank * blpr_2: (rank + 1) * blpr_2])
-        symm_mem_hdl.barrier(channel=7)
-        multimem_all_gather_async(
-            hidden_states_2,
-            symm_mem_hdl,
-            offset_second,
-            blpr_2 * num_bytes_per_token,
-            current_stream,
-        )
-        symm_mem_hdl.barrier(channel=9)
+        if use_multimem:
+            multimem_reduce_scatter(
+                hidden_states_2,
+                symm_mem_hdl,
+                offset_second,
+                MAX_CTAS=8
+            )
+            self.input_layernorm(
+                hidden_states_2[rank * blpr_2: (rank + 1) * blpr_2],
+                out=residual_2[rank * blpr_2: (rank + 1) * blpr_2])
+            symm_mem_hdl.barrier(channel=7)
+            multimem_all_gather_async(
+                hidden_states_2,
+                symm_mem_hdl,
+                offset_second,
+                blpr_2 * num_bytes_per_token,
+                current_stream,
+            )
+            symm_mem_hdl.barrier(channel=9)
+        else:
+            if world_size > 1:
+                if not dist.is_initialized():
+                    raise RuntimeError("torch.distributed must be initialized for A100 tokenweave fallback.")
+                group = _get_tp_device_group()
+                start = rank * blpr_2
+                end = (rank + 1) * blpr_2
+                dist.reduce_scatter_tensor(
+                    hidden_states_2[start:end],
+                    hidden_states_2,
+                    op=dist.ReduceOp.SUM,
+                    group=group,
+                )
+                self.input_layernorm(
+                    hidden_states_2[start:end],
+                    out=residual_2[start:end],
+                )
+                dist.all_gather_into_tensor(
+                    hidden_states_2,
+                    hidden_states_2[start:end],
+                    group=group,
+                )
+            else:
+                self.input_layernorm(hidden_states_2, out=residual_2)
     else:
         # === Fused all reduce + Pre-Attn Norm + residual add on split-1 ===
         with torch.cuda.stream(copy_stream):

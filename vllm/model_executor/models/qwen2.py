@@ -63,7 +63,8 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
-from .tokenweave_utils import (load_config, tokenweave_with_fuse_only, tokenweave_overlap)
+from .tokenweave_utils import (load_config, tokenweave_with_fuse_only,
+                               tokenweave_overlap, supports_multimem)
 
 logger = init_logger(__name__)
 
@@ -416,10 +417,21 @@ class Qwen2Model(nn.Module):
 
         ## --------- TokenWeave: pq_overlap_fused --------- #
         CHUNK_SIZE = vllm_config.scheduler_config.max_num_batched_tokens + 512
-        self.staging_buffer = symm_mem.empty((CHUNK_SIZE, config.hidden_size),
-                                          dtype=vllm_config.model_config.dtype,
-                                          device="cuda")
-        self.symm_mem_hdl = symm_mem.rendezvous(self.staging_buffer, get_device_group())
+        use_multimem = supports_multimem(torch.device("cuda"))
+        if use_multimem:
+            self.staging_buffer = symm_mem.empty(
+                (CHUNK_SIZE, config.hidden_size),
+                dtype=vllm_config.model_config.dtype,
+                device="cuda",
+            )
+            self.symm_mem_hdl = symm_mem.rendezvous(self.staging_buffer, get_device_group())
+        else:
+            self.staging_buffer = torch.empty(
+                (CHUNK_SIZE, config.hidden_size),
+                dtype=vllm_config.model_config.dtype,
+                device="cuda",
+            )
+            self.symm_mem_hdl = None
         self.current_stream = torch.cuda.current_stream()
         self.copy_stream = torch.cuda.Stream(priority=-1)
         self.buff = None
