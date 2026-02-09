@@ -147,7 +147,8 @@ fused_rs_ln_ag_cta_kernel(
       vec_t temp = residual_o[idx];
       temp *= s_variance;
       temp *= shared_weight;
-      multimem_st<16>(mcptr + offset_scalar + idx * width, *(reinterpret_cast<Vec<16> *>(&temp)));
+      multimem_st<16>(mcptr + offset_scalar + idx * width,
+                      *(reinterpret_cast<Vec<16> *>(&temp)));
     }
   }
   __syncthreads();
